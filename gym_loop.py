@@ -89,7 +89,9 @@ PLUG_TIMEOUT = 10 * 60     # seconds; refreshed on every poll while present, so 
 FACES_DIR = Path(__file__).parent / "local" / "faces" / "joe"
 GYM_GOAL = "gymvisit"
 BEEMINDER_API = "https://www.beeminder.com/api/v1"
-NTFY_TOPIC = "REDACTED-NTFY-TOPIC"  # private/unguessable; subscribed on Joe's phone in the ntfy app
+# NTFY_TOPIC comes from the environment (~/.local_bashrc), not hardcoded here -- ntfy's free
+# tier has no real access control, an unguessable topic name IS the whole security model, so
+# it can't sit in a repo that might ever be public.
 
 # XDG state dir: logs and the rolling photo archive are runtime state, not
 # config and not something to back up, so they don't belong in the repo.
@@ -124,8 +126,12 @@ def archive_photo(jpeg_bytes: bytes) -> None:
 
 
 def notify(message: str) -> None:
+    topic = ({**_bashrc_exports(), **os.environ}).get("NTFY_TOPIC")
+    if not topic:
+        log.warning("NTFY_TOPIC not set, can't notify")
+        return
     try:
-        urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{NTFY_TOPIC}",
+        urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{topic}",
                                                         data=message.encode()), timeout=10)
     except urllib.error.URLError as e:
         log.warning(f"notify failed: {e}")
