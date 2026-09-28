@@ -177,15 +177,35 @@ def _beeminder_auth() -> tuple[str, str] | None:
     return token, user
 
 
-def log_gymvisit(comment: str, dry_run: bool) -> str | None:
-    """Creates the datapoint immediately on match, before the session's duration is known.
-    Returns the new datapoint's id so update_gymvisit_duration can fill that in once it is."""
+def find_todays_datapoint(auth: tuple[str, str]) -> dict | None:
+    """A second gym session later the same day should extend today's existing datapoint, not
+    create a sibling -- one entry per day, not one per session."""
+    token, user = auth
+    today = time.strftime("%Y%m%d")
+    url = f"{BEEMINDER_API}/users/{user}/goals/{GYM_GOAL}/datapoints.json?{urllib.parse.urlencode({'auth_token': token, 'count': 10})}"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            points = json.loads(r.read())
+    except urllib.error.URLError as e:
+        log.error(f"failed to check for today's {GYM_GOAL} datapoint: {e}")
+        return None
+    return next((p for p in points if p.get("daystamp") == today), None)
+
+
+def log_gymvisit(comment: str, dry_run: bool) -> tuple[str | None, str]:
+    """Creates today's datapoint, or finds it if an earlier session today already made one.
+    Returns (datapoint_id, existing_comment) -- existing_comment is '' for a fresh datapoint,
+    so update_gymvisit_duration knows whether to set the comment or extend it."""
     if dry_run:
         log.info(f"[dry-run] would log {GYM_GOAL}: {comment}")
-        return None
+        return None, ""
     auth = _beeminder_auth()
     if not auth:
-        return None
+        return None, ""
+    existing = find_todays_datapoint(auth)
+    if existing:
+        log.info(f"today's {GYM_GOAL} datapoint already exists (id {existing['id']}), extending it")
+        return existing["id"], existing.get("comment", "")
     token, user = auth
     url = f"{BEEMINDER_API}/users/{user}/goals/{GYM_GOAL}/datapoints.json"
     form = urllib.parse.urlencode({"auth_token": token, "value": 1, "comment": comment}).encode()
@@ -193,10 +213,10 @@ def log_gymvisit(comment: str, dry_run: bool) -> str | None:
         with urllib.request.urlopen(urllib.request.Request(url, form), timeout=30) as r:
             point = json.loads(r.read())
         log.info(f"logged {GYM_GOAL}: {comment} (id {point['id']})")
-        return point["id"]
+        return point["id"], ""
     except urllib.error.URLError as e:
         log.error(f"failed to log {GYM_GOAL}: {e}")
-        return None
+        return None, ""
 
 
 def update_gymvisit_duration(datapoint_id: str | None, comment: str, dry_run: bool) -> None:
@@ -239,9 +259,11 @@ class Session:
     last_face_check: float = 0.0
     matched: bool = False
     datapoint_id: str | None = None
+    existing_comment: str = ""  # non-empty if today's datapoint predates this session
 
     def start(self) -> None:
         self.active, self.matched, self.datapoint_id = True, False, None
+        self.existing_comment = ""
         self.started_at = time.time()
         log.info("session start")
 
@@ -251,7 +273,9 @@ class Session:
         minutes = (self.last_seen - self.started_at) / 60
         log.info(f"session end ({minutes:.0f} min)")
         if self.matched:
-            update_gymvisit_duration(self.datapoint_id, f"gym camera auto-detect, ~{minutes:.0f} min", dry_run)
+            comment = (f"{self.existing_comment}; +{minutes:.0f} min" if self.existing_comment
+                       else f"gym camera auto-detect, ~{minutes:.0f} min")
+            update_gymvisit_duration(self.datapoint_id, comment, dry_run)
         self.active = False
 
 
@@ -283,7 +307,8 @@ def run(dry_run: bool, once: bool) -> None:
                 if not session.matched and matches_joe(photo, known):
                     session.matched = True
                     notify("Gym camera recognized you — this session will count.")
-                    session.datapoint_id = log_gymvisit("gym camera auto-detect (session in progress)", dry_run)
+                    session.datapoint_id, session.existing_comment = log_gymvisit(
+                        "gym camera auto-detect (session in progress)", dry_run)
         elif session.active and now - session.last_seen >= SESSION_GAP:
             session.end(dry_run)
 
