@@ -49,8 +49,14 @@ class Plug:
     def name(self) -> str:
         return self._rpc("Switch.GetConfig", id=0)["name"] or self.key
 
-    def set(self, on: bool) -> None:
-        self._rpc("Switch.Set", id=0, on=on)
+    def set(self, on: bool, toggle_after: float | None = None) -> None:
+        """toggle_after: seconds until the Shelly itself reverts this switch, regardless of
+        whether anything is still around to tell it to. Calling this again before it fires
+        replaces the pending timer rather than stacking another one."""
+        params = {"id": 0, "on": on}
+        if toggle_after is not None:
+            params["toggle_after"] = toggle_after
+        self._rpc("Switch.Set", **params)
 
 
 def find_plug(name: str) -> Plug:
