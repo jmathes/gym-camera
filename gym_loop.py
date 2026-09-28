@@ -12,15 +12,18 @@ so identity failing should never take the plugs down with it:
     timer set on the Shelly's own firmware, refreshed every poll. There's no
     software "off" command anymore -- the plug turns itself off on schedule
     even if this whole process dies, which is the point.
-  - Identity mode: while a presence session is active, every
-    FACE_CHECK_INTERVAL seconds (~1Hz): snap a still, archive it (see below),
-    and -- until matched once this session -- check it against the reference
-    photos in local/faces/joe/*.jpg. Matching is a two-stage locate-cheap/
-    encode-precise split (see matches_joe) so this stays affordable at ~1Hz
-    instead of the ~3s a naive full-res check costs. The moment a match
-    lands: a phone notification fires, and the Beeminder datapoint is
-    created immediately too (value=1, a placeholder comment) so credit shows
-    up right away instead of after a 15-minute wait.
+  - Identity mode: while a presence session is active and not yet matched,
+    every FACE_CHECK_INTERVAL seconds (~1Hz): snap a still, archive it (see
+    below), and check it against the reference photos in local/faces/joe/*.jpg.
+    Matching is a two-stage locate-cheap/encode-precise split (see
+    matches_joe) so this stays affordable at ~1Hz instead of the ~3s a naive
+    full-res check costs. The moment a match lands: a phone notification
+    fires, and the Beeminder datapoint is created immediately too (value=1,
+    a placeholder comment) so credit shows up right away instead of after a
+    15-minute wait. Once matched, snapshotting drops to ARCHIVE_INTERVAL for
+    the rest of the session -- there's no more identity to determine, and
+    each full-res snap is a real ~400KB pull over the camera's WiFi link, not
+    something to keep doing every second for an hour-long workout.
   - A presence session ends after SESSION_GAP seconds of nobody seen (a
     brief step out of frame doesn't split one visit into two). That's when,
     if matched, the same Beeminder datapoint gets PUT-updated in place with
@@ -33,8 +36,9 @@ so identity failing should never take the plugs down with it:
 Logs and the photo archive live under ~/.local/state/gym-camera/ (XDG state
 dir — runtime data, not config, not backed up), not in the repo:
   - logs/gym-camera.log — rotating log of session/match/Beeminder events.
-  - photos/YYYYMMDD-HHMMSS.jpg — one still per FACE_CHECK_INTERVAL for every
-    second someone's present, pruned after PHOTO_RETENTION_DAYS.
+  - photos/YYYYMMDD-HHMMSS.jpg — one still per FACE_CHECK_INTERVAL while
+    unmatched, then one per ARCHIVE_INTERVAL for the rest of the session,
+    pruned after PHOTO_RETENTION_DAYS.
 
 Needs the `gym` conda env (onnxruntime, opencv-python-headless,
 face_recognition) and REOLINK_USER/REOLINK_PASSWORD/BEEMINDER_AUTH_TOKEN/
@@ -67,9 +71,14 @@ from gym import CAMERA_HOST, Camera, Plug, PLUGS, _bashrc_exports
 import os
 
 POLL_INTERVAL = 1          # seconds between "is anyone there" checks (cheap: ~0.07s/call)
-FACE_CHECK_INTERVAL = 1    # seconds between face-match attempts during a session -- feasible
-                           # at ~1Hz because of the two-stage locate/encode split below, not
-                           # because full-res detection got any cheaper (it's still ~3s alone)
+FACE_CHECK_INTERVAL = 1    # seconds between face-match attempts, only while still unmatched --
+                           # feasible at ~1Hz because of the two-stage locate/encode split below,
+                           # not because full-res detection got any cheaper (still ~3s alone)
+ARCHIVE_INTERVAL = 30      # seconds between archive-only snapshots once already matched -- each
+                           # full-res photo is a real ~400KB pull over the camera's WiFi link, so
+                           # once identity's settled there's no reason to keep pulling one a
+                           # second for the rest of a session; that cost is what caused
+                           # noticeable WiFi contention with other devices on 2026-09-27
 SESSION_GAP = 15 * 60      # seconds of "nobody" before a Beeminder-attribution session is over
 FACE_TOLERANCE = 0.6       # face_recognition's default; lower = stricter
 FACE_LOCATE_MAX_DIM = 640  # downscale target for the cheap first-pass face *location* search
@@ -296,11 +305,10 @@ def run(dry_run: bool, once: bool) -> None:
             if not session.active:
                 session.start()
             session.last_seen = now
-            # Snap + archive on this cadence regardless of match state, so the
-            # photo archive covers the whole session, not just until the first
-            # match. Face-matching itself stops once matched, since there's
-            # nothing left to determine.
-            if now - session.last_face_check >= FACE_CHECK_INTERVAL:
+            # Fast while still trying to identify who this is; slow once that's settled --
+            # each snap is a real ~400KB pull over the camera's WiFi link, not free bandwidth.
+            interval = FACE_CHECK_INTERVAL if not session.matched else ARCHIVE_INTERVAL
+            if now - session.last_face_check >= interval:
                 session.last_face_check = now
                 photo = camera.snap()
                 archive_photo(photo)
