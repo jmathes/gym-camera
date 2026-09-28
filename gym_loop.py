@@ -18,15 +18,17 @@ so identity failing should never take the plugs down with it:
     photos in local/faces/joe/*.jpg. Matching is a two-stage locate-cheap/
     encode-precise split (see matches_joe) so this stays affordable at ~1Hz
     instead of the ~3s a naive full-res check costs. The moment a match
-    lands, it sends a phone notification right away -- but the Beeminder
-    datapoint itself waits for session end, so its comment can include how
-    long the session actually ran.
+    lands: a phone notification fires, and the Beeminder datapoint is
+    created immediately too (value=1, a placeholder comment) so credit shows
+    up right away instead of after a 15-minute wait.
   - A presence session ends after SESSION_GAP seconds of nobody seen (a
     brief step out of frame doesn't split one visit into two). That's when,
-    if matched, the Beeminder datapoint gets logged, with duration measured
-    from first-seen to last-seen (not counting the SESSION_GAP wait itself).
-    This gap timer is bookkeeping for Beeminder attribution only -- it
-    doesn't gate the plugs, which run on their own hardware timer.
+    if matched, the same Beeminder datapoint gets PUT-updated in place with
+    its final comment, adding duration measured from first-seen to last-seen
+    (not counting the SESSION_GAP wait itself) -- the value was already
+    right, only the comment changes. This gap timer is bookkeeping for
+    Beeminder attribution only -- it doesn't gate the plugs, which run on
+    their own hardware timer.
 
 Logs and the photo archive live under ~/.local/state/gym-camera/ (XDG state
 dir — runtime data, not config, not backed up), not in the repo:
@@ -47,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import logging
 import logging.handlers
 import time
@@ -165,23 +168,55 @@ def matches_joe(jpeg_bytes: bytes, known: list[np.ndarray]) -> bool:
     return False
 
 
-def log_gymvisit(comment: str, dry_run: bool) -> None:
-    if dry_run:
-        log.info(f"[dry-run] would log {GYM_GOAL}: {comment}")
-        return
+def _beeminder_auth() -> tuple[str, str] | None:
     env = {**_bashrc_exports(), **os.environ}
     token, user = env.get("BEEMINDER_AUTH_TOKEN"), env.get("BEEMINDER_USER")
     if not token or not user:
         log.error("BEEMINDER_AUTH_TOKEN/BEEMINDER_USER not set, can't log")
-        return
+        return None
+    return token, user
+
+
+def log_gymvisit(comment: str, dry_run: bool) -> str | None:
+    """Creates the datapoint immediately on match, before the session's duration is known.
+    Returns the new datapoint's id so update_gymvisit_duration can fill that in once it is."""
+    if dry_run:
+        log.info(f"[dry-run] would log {GYM_GOAL}: {comment}")
+        return None
+    auth = _beeminder_auth()
+    if not auth:
+        return None
+    token, user = auth
     url = f"{BEEMINDER_API}/users/{user}/goals/{GYM_GOAL}/datapoints.json"
     form = urllib.parse.urlencode({"auth_token": token, "value": 1, "comment": comment}).encode()
     try:
         with urllib.request.urlopen(urllib.request.Request(url, form), timeout=30) as r:
-            r.read()
-        log.info(f"logged {GYM_GOAL}: {comment}")
+            point = json.loads(r.read())
+        log.info(f"logged {GYM_GOAL}: {comment} (id {point['id']})")
+        return point["id"]
     except urllib.error.URLError as e:
         log.error(f"failed to log {GYM_GOAL}: {e}")
+        return None
+
+
+def update_gymvisit_duration(datapoint_id: str | None, comment: str, dry_run: bool) -> None:
+    if dry_run:
+        log.info(f"[dry-run] would update {GYM_GOAL} datapoint: {comment}")
+        return
+    if not datapoint_id:
+        return
+    auth = _beeminder_auth()
+    if not auth:
+        return
+    token, user = auth
+    url = f"{BEEMINDER_API}/users/{user}/goals/{GYM_GOAL}/datapoints/{datapoint_id}.json"
+    form = urllib.parse.urlencode({"auth_token": token, "comment": comment}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, form, method="PUT"), timeout=30) as r:
+            r.read()
+        log.info(f"updated {GYM_GOAL} datapoint {datapoint_id}: {comment}")
+    except urllib.error.URLError as e:
+        log.error(f"failed to update {GYM_GOAL} datapoint {datapoint_id}: {e}")
 
 
 def refresh_plugs() -> None:
@@ -203,9 +238,10 @@ class Session:
     last_seen: float = 0.0
     last_face_check: float = 0.0
     matched: bool = False
+    datapoint_id: str | None = None
 
     def start(self) -> None:
-        self.active, self.matched = True, False
+        self.active, self.matched, self.datapoint_id = True, False, None
         self.started_at = time.time()
         log.info("session start")
 
@@ -215,7 +251,7 @@ class Session:
         minutes = (self.last_seen - self.started_at) / 60
         log.info(f"session end ({minutes:.0f} min)")
         if self.matched:
-            log_gymvisit(f"gym camera auto-detect, ~{minutes:.0f} min", dry_run)
+            update_gymvisit_duration(self.datapoint_id, f"gym camera auto-detect, ~{minutes:.0f} min", dry_run)
         self.active = False
 
 
@@ -247,6 +283,7 @@ def run(dry_run: bool, once: bool) -> None:
                 if not session.matched and matches_joe(photo, known):
                     session.matched = True
                     notify("Gym camera recognized you — this session will count.")
+                    session.datapoint_id = log_gymvisit("gym camera auto-detect (session in progress)", dry_run)
         elif session.active and now - session.last_seen >= SESSION_GAP:
             session.end(dry_run)
 
