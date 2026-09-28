@@ -3,18 +3,30 @@
 
     gym_loop.py run [--dry-run] [--once]
 
-Loop:
-  - poll the camera's own person/vehicle/pet detector every POLL_INTERVAL
-    seconds (cheap: one HTTP call, no local ML).
-  - person seen and no session active -> start a session, turn on both plugs
-    (fan + Aromadd).
-  - during an active session, every FACE_CHECK_INTERVAL seconds: snap a
-    still, archive it (see below), and — until matched once — check it
-    against the reference photos in local/faces/joe/*.jpg. First match logs
-    the gymvisit Beeminder datapoint for this session (once) and sends a
-    phone notification.
-  - no person seen for SESSION_GAP seconds -> end the session, turn both
-    plugs off. A brief step out of frame doesn't end the session early.
+Two independent modes, on purpose -- presence is reliable and identity isn't,
+so identity failing should never take the plugs down with it:
+
+  - Presence mode: every POLL_INTERVAL seconds, ask the camera's own
+    person/vehicle/pet detector whether anyone's there (cheap: one HTTP call,
+    no local ML). If so, turn both plugs on with a PLUG_TIMEOUT auto-off
+    timer set on the Shelly's own firmware, refreshed every poll. There's no
+    software "off" command anymore -- the plug turns itself off on schedule
+    even if this whole process dies, which is the point.
+  - Identity mode: while a presence session is active, every
+    FACE_CHECK_INTERVAL seconds (~1Hz): snap a still, archive it (see below),
+    and -- until matched once this session -- check it against the reference
+    photos in local/faces/joe/*.jpg. Matching is a two-stage locate-cheap/
+    encode-precise split (see matches_joe) so this stays affordable at ~1Hz
+    instead of the ~3s a naive full-res check costs. The moment a match
+    lands, it sends a phone notification right away -- but the Beeminder
+    datapoint itself waits for session end, so its comment can include how
+    long the session actually ran.
+  - A presence session ends after SESSION_GAP seconds of nobody seen (a
+    brief step out of frame doesn't split one visit into two). That's when,
+    if matched, the Beeminder datapoint gets logged, with duration measured
+    from first-seen to last-seen (not counting the SESSION_GAP wait itself).
+    This gap timer is bookkeeping for Beeminder attribution only -- it
+    doesn't gate the plugs, which run on their own hardware timer.
 
 Logs and the photo archive live under ~/.local/state/gym-camera/ (XDG state
 dir — runtime data, not config, not backed up), not in the repo:
@@ -46,14 +58,18 @@ from pathlib import Path
 
 import face_recognition
 import numpy as np
+from PIL import Image
 
 from gym import CAMERA_HOST, Camera, Plug, PLUGS, _bashrc_exports
 import os
 
-POLL_INTERVAL = 5          # seconds between "is anyone there" checks
-FACE_CHECK_INTERVAL = 30   # seconds between face-match attempts during a session
+POLL_INTERVAL = 1          # seconds between "is anyone there" checks (cheap: ~0.07s/call)
+FACE_CHECK_INTERVAL = 1    # seconds between face-match attempts during a session -- feasible
+                           # at ~1Hz because of the two-stage locate/encode split below, not
+                           # because full-res detection got any cheaper (it's still ~3s alone)
 SESSION_GAP = 15 * 60      # seconds of "nobody" before a Beeminder-attribution session is over
 FACE_TOLERANCE = 0.6       # face_recognition's default; lower = stricter
+FACE_LOCATE_MAX_DIM = 640  # downscale target for the cheap first-pass face *location* search
 PHOTO_RETENTION_DAYS = 7   # how long to keep archived presence photos
 PLUG_TIMEOUT = 10 * 60     # seconds; refreshed on every poll while present, so the Shelly
                            # itself turns the plugs off if this process dies or hangs
@@ -116,12 +132,36 @@ def load_known_faces(faces_dir: Path) -> list[np.ndarray]:
 
 
 def matches_joe(jpeg_bytes: bytes, known: list[np.ndarray]) -> bool:
-    if not known:
+    """Two-stage: locate faces on a cheap downscaled copy (~0.2s regardless of the source
+    resolution), then encode only those regions from the original full-res image (~0.15s per
+    face). This is what makes ~1Hz checking affordable -- running detection on the full
+    2560x1920 frame directly costs ~3s on its own, every time.
+
+    Logs every attempt, not just successes -- a check that ran and found no usable face is a
+    different, useful fact from one that found and matched a face, and both are different from
+    this process not running at all."""
+    full = face_recognition.load_image_file(io.BytesIO(jpeg_bytes))
+    h, w = full.shape[:2]
+    scale = min(1.0, FACE_LOCATE_MAX_DIM / max(h, w))
+    small = np.array(Image.fromarray(full).resize((int(w * scale), int(h * scale)))) if scale < 1.0 else full
+
+    locations = face_recognition.face_locations(small)
+    if not locations:
+        log.info("face check: no face detected in frame")
         return False
-    image = face_recognition.load_image_file(io.BytesIO(jpeg_bytes))
-    for encoding in face_recognition.face_encodings(image):
+
+    inv = 1 / scale
+    full_locations = [(int(t * inv), int(r * inv), int(b * inv), int(l * inv)) for t, r, b, l in locations]
+    faces = face_recognition.face_encodings(full, known_face_locations=full_locations)
+
+    if not known:
+        log.info(f"face check: {len(faces)} face(s) detected, but no reference photos loaded")
+        return False
+    for encoding in faces:
         if any(face_recognition.compare_faces(known, encoding, tolerance=FACE_TOLERANCE)):
+            log.info(f"face check: {len(faces)} face(s) detected, matched Joe")
             return True
+    log.info(f"face check: {len(faces)} face(s) detected, none matched Joe")
     return False
 
 
@@ -159,18 +199,23 @@ class Session:
     """Tracks one continuous presence for Beeminder attribution. Doesn't touch the plugs —
     that's refresh_plugs()'s job, on presence alone, independent of identity."""
     active: bool = False
+    started_at: float = 0.0
     last_seen: float = 0.0
     last_face_check: float = 0.0
     matched: bool = False
 
     def start(self) -> None:
         self.active, self.matched = True, False
+        self.started_at = time.time()
         log.info("session start")
 
     def end(self, dry_run: bool) -> None:
-        log.info("session end")
+        # last_seen, not now: duration is first-seen to last-seen, not including the
+        # trailing SESSION_GAP wait before we're confident you've actually left.
+        minutes = (self.last_seen - self.started_at) / 60
+        log.info(f"session end ({minutes:.0f} min)")
         if self.matched:
-            log_gymvisit("gym camera auto-detect", dry_run)
+            log_gymvisit(f"gym camera auto-detect, ~{minutes:.0f} min", dry_run)
         self.active = False
 
 
@@ -201,7 +246,6 @@ def run(dry_run: bool, once: bool) -> None:
                 archive_photo(photo)
                 if not session.matched and matches_joe(photo, known):
                     session.matched = True
-                    log.info("face match: Joe confirmed for this session")
                     notify("Gym camera recognized you — this session will count.")
         elif session.active and now - session.last_seen >= SESSION_GAP:
             session.end(dry_run)
