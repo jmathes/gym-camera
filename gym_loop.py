@@ -300,10 +300,17 @@ def run(dry_run: bool, once: bool) -> None:
     known = load_known_faces(FACES_DIR)
     log.info(f"{len(known)} reference face(s) loaded from {FACES_DIR}")
     session = Session()
+    was_present = False
 
     while True:
         now = time.time()
         present = camera.sees_person()
+        if present != was_present:
+            # Independent of matches_joe()'s own logging, which stops firing once matched
+            # (see below) -- without this, a long stretch of the camera simply not seeing
+            # anyone is indistinguishable in the log from a long stretch of normal silence.
+            log.info("presence: person detected" if present else "presence: no longer detected")
+            was_present = present
 
         if present:
             refresh_plugs()  # presence mode: on/refresh regardless of identity
