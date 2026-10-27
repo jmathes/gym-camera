@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """gym — local control of the gym camera and smart plugs on zahlbericht.
 
-    gym.py plug                      show both Shelly plugs and their on/off state and watts
-    gym.py plug on|off NAME          switch one plug ("fan" / "aromadd", or its full name)
-    gym.py snap OUT.jpg              save one 2560x1920 still from the Reolink camera
-    gym.py person                    ask the camera's built-in AI if it sees a person now
+    gym.py plug                      show the Shelly plugs and their on/off state and watts
+    gym.py plug on|off NAME          switch one plug ("gym-aromadd" / "fan" / "hvac-aromadd", or its full name)
+    gym.py snap OUT.jpg [CAMERA]     save one 2560x1920 still from a Reolink camera (default: window)
+    gym.py person                    ask each camera's built-in AI if it sees a person now
 
 Reolink needs REOLINK_USER and REOLINK_PASSWORD, from the environment or ~/.local_bashrc.
 The Shelly plugs have no auth and speak plain HTTP RPC (Gen2+ API).
@@ -20,11 +20,20 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-CAMERA_HOST = "192.168.86.39"  # gym.lan, Reolink RLC-510WA (MAC ec:71:db:ea:6c:f2)
-PLUGS = {                      # Shelly Plug US Gen4 (S4PL-00116US)
-    "fan": "192.168.86.37",      # "oscillating fan power", MAC e8:f6:0a:7d:ff:c8, ~58 W when on
-    "aromadd": "192.168.86.36",  # "Aromadd power", MAC e8:f6:0a:7d:67:f4
+CAMERAS = {                    # Reolink RLC-510WA; the router calls both of them gym.lan
+    "window": "192.168.86.39",   # "Gym Camera - Window Corner", MAC ec:71:db:ea:6c:f2
+    "doors": "192.168.86.248",   # "Gym Camera - Between Doors", MAC ec:71:db:ea:6a:36
 }
+PLUGS = {                      # Shelly Plug US Gen4 (S4PL-00116US)
+    # Each Shelly announces itself over mDNS as <its device id>.local, which embeds its MAC,
+    # so these keep working when DHCP hands a plug a new IP.
+    "gym-aromadd": "shellyplugusg4-e8f60a7d67f4.local",   # "Gym Aromadd", was 192.168.86.36
+    "fan": "shellyplugusg4-acebe6f4cf24.local",           # "Gym Fan", ~54 W, was 192.168.86.38
+    # Was the gym fan's plug. Now powers the Aromadd on the furnace plenum, which should
+    # run only while the HVAC blower does, so the gym loop must never switch it.
+    "hvac-aromadd": "shellyplugusg4-e8f60a7dffc8.local",  # "HVAC Aromadd", was 192.168.86.37
+}
+GYM_PLUGS = {k: PLUGS[k] for k in ("gym-aromadd", "fan")}  # the plugs gym_loop.py drives
 
 
 def _get_json(url: str, data: bytes | None = None, timeout: float = 10) -> object:
@@ -38,10 +47,10 @@ class Plug:
     key: str
     host: str
 
-    def _rpc(self, method: str, **params) -> dict:
+    def _rpc(self, method: str, timeout: float = 5, **params) -> dict:
         q = urllib.parse.urlencode({k: json.dumps(v) if isinstance(v, (bool, dict)) else v
                                     for k, v in params.items()})
-        return _get_json(f"http://{self.host}/rpc/{method}?{q}", timeout=5)
+        return _get_json(f"http://{self.host}/rpc/{method}?{q}", timeout=timeout)
 
     def status(self) -> dict:
         return self._rpc("Switch.GetStatus", id=0)
@@ -49,14 +58,14 @@ class Plug:
     def name(self) -> str:
         return self._rpc("Switch.GetConfig", id=0)["name"] or self.key
 
-    def set(self, on: bool, toggle_after: float | None = None) -> None:
+    def set(self, on: bool, toggle_after: float | None = None, timeout: float = 5) -> None:
         """toggle_after: seconds until the Shelly itself reverts this switch, regardless of
         whether anything is still around to tell it to. Calling this again before it fires
         replaces the pending timer rather than stacking another one."""
         params = {"id": 0, "on": on}
         if toggle_after is not None:
             params["toggle_after"] = toggle_after
-        self._rpc("Switch.Set", **params)
+        self._rpc("Switch.Set", timeout=timeout, **params)
 
 
 def find_plug(name: str) -> Plug:
@@ -99,9 +108,9 @@ class Camera:
         q |= {"user": self.user, "password": self.password}
         return f"http://{self.host}/cgi-bin/api.cgi?{urllib.parse.urlencode(q)}"
 
-    def api(self, cmd: str, param: dict | None = None) -> dict:
+    def api(self, cmd: str, param: dict | None = None, timeout: float = 10) -> dict:
         body = json.dumps([{"cmd": cmd, "action": 0, "param": param or {}}]).encode()
-        res = _get_json(self._url(cmd=cmd), body)[0]
+        res = _get_json(self._url(cmd=cmd), body, timeout=timeout)[0]
         if res["code"] != 0:
             raise RuntimeError(f"{cmd}: {res.get('error')}")
         return res["value"]
@@ -111,12 +120,12 @@ class Camera:
         with urllib.request.urlopen(self._url(cmd="Snap", channel=0, rs="gym"), timeout=15) as r:
             body = r.read()
         if body[:2] != b"\xff\xd8":
-            sys.exit(f"camera did not return a JPEG: {body[:300]!r}")
+            raise RuntimeError(f"camera did not return a JPEG: {body[:300]!r}")
         return body
 
-    def sees_person(self) -> bool:
+    def sees_person(self, timeout: float = 10) -> bool:
         """The RLC-510WA runs its own person/vehicle/pet detector; this reads its current verdict."""
-        return bool(self.api("GetAiState", {"channel": 0})["people"]["alarm_state"])
+        return bool(self.api("GetAiState", {"channel": 0}, timeout=timeout)["people"]["alarm_state"])
 
 
 def main() -> None:
@@ -127,7 +136,8 @@ def main() -> None:
     pp.add_argument("name", nargs="?")
     ps = sub.add_parser("snap", help="save one camera still")
     ps.add_argument("out")
-    sub.add_parser("person", help="does the camera see a person right now?")
+    ps.add_argument("camera", nargs="?", choices=list(CAMERAS), default="window")
+    sub.add_parser("person", help="does each camera see a person right now?")
     a = p.parse_args()
 
     if a.cmd == "plug":
@@ -141,10 +151,11 @@ def main() -> None:
             print(f"{'ON ' if s['output'] else 'off'}  {s['apower']:6.1f} W  {plug.name()}  ({host})")
     elif a.cmd == "snap":
         with open(a.out, "wb") as f:
-            f.write(Camera.from_env(CAMERA_HOST).snap())
+            f.write(Camera.from_env(CAMERAS[a.camera]).snap())
         print(f"wrote {a.out}")
     else:
-        print("person" if Camera.from_env(CAMERA_HOST).sees_person() else "nobody")
+        for key, host in CAMERAS.items():
+            print(f"{key:7} {'person' if Camera.from_env(host).sees_person() else 'nobody'}")
 
 
 if __name__ == "__main__":
