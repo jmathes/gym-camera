@@ -23,11 +23,10 @@ Raspberry Pi once the design is proven out.
 ## Credentials
 
 Reads `REOLINK_USER`, `REOLINK_PASSWORD`, `BEEMINDER_AUTH_TOKEN`,
-`BEEMINDER_USER`, `NTFY_TOPIC` from `~/.local_bashrc`, same convention as
-`prod`. `NTFY_TOPIC` counts as a credential even though it doesn't look like
-one: ntfy's free tier has no real access control, so the topic name being
-unguessable is the only thing stopping someone else from posting
-notifications to it.
+`BEEMINDER_USER`, `HILBERT_PUSH_KEY` from `~/.local_bashrc`, same convention as
+`prod`. `HILBERT_PUSH_KEY` is the key for the house's phone notifications on
+noether (`http://noether:8203`, hilbert-sdk's `automations/services/phone_push.py`),
+which put the "recognized you" notification on Joe's phone.
 
 ## Running
 

@@ -133,9 +133,6 @@ PLUG_TIMEOUT = 10 * 60     # seconds; refreshed on every poll while present, so 
 FACES_DIR = Path(__file__).parent / "local" / "faces" / "joe"
 GYM_GOAL = "gymvisit"
 BEEMINDER_API = "https://www.beeminder.com/api/v1"
-# NTFY_TOPIC comes from the environment (~/.local_bashrc), not hardcoded here -- ntfy's free
-# tier has no real access control, an unguessable topic name IS the whole security model, so
-# it can't sit in a repo that might ever be public.
 
 # XDG state dir: logs and the rolling photo archive are runtime state, not
 # config and not something to back up, so they don't belong in the repo.
@@ -149,7 +146,7 @@ FACE_CACHE = STATE_DIR / "known_faces.npz"
 
 log = logging.getLogger("gym_loop")
 
-# What a failed HTTP call to ntfy or Beeminder can raise. URLError alone misses read timeouts
+# What a failed HTTP call to the phone notifications or Beeminder can raise. URLError alone misses read timeouts
 # (TimeoutError), dropped connections (http.client.HTTPException, ConnectionError) and a
 # garbled body (ValueError from json) -- any of which would otherwise crash the tick.
 NET_ERRORS = (OSError, ValueError, http.client.HTTPException)
@@ -179,16 +176,22 @@ def archive_photo(jpeg_bytes: bytes, camera_key: str) -> None:
 
 
 def notify(message: str) -> None:
-    topic = ({**_bashrc_exports(), **os.environ}).get("NTFY_TOPIC")
-    if not topic:
-        log.warning("NTFY_TOPIC not set, can't notify")
+    # A notification on Joe's phone, through the house's phone notifications on noether
+    # (hilbert-sdk's automations/services/phone_push.py).
+    env = {**_bashrc_exports(), **os.environ}
+    key = env.get("HILBERT_PUSH_KEY")
+    if not key:
+        log.warning("HILBERT_PUSH_KEY not set, can't notify")
         return
+    url = env.get("HILBERT_PUSH_URL", "http://noether:8203")
     try:
-        # The Title marks this as automation: prod's bin/ntfy-claude answers any untitled message
-        # on the topic as if Joe typed it on his phone, so every automatic message needs a Title.
-        urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{topic}",
-                                                        data=message.encode(),
-                                                        headers={"Title": "Gym camera"}), timeout=10)
+        request = urllib.request.Request(f"{url}/send/joe", method="POST",
+                                         data=json.dumps({"title": "Gym camera", "text": message}).encode(),
+                                         headers={"Authorization": f"Bearer {key}",
+                                                  "Content-Type": "application/json"})
+        answer = json.loads(urllib.request.urlopen(request, timeout=30).read())
+        if not answer.get("sent"):
+            log.warning(f"notify reached no phone: {answer}")
     except NET_ERRORS as e:
         log.warning(f"notify failed: {e}")
 
